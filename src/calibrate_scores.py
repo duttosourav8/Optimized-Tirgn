@@ -16,7 +16,7 @@ from history_validity_calibration import (
     build_sr_history,
     build_so_history,
     build_ro_history,
-    build_dense_history_features_dual,
+    build_topk_history_features_dual,
     novelty_bucket_from_history,
     stale_exact_bucket,
     RelationHistoryValidityCalibrator,
@@ -38,6 +38,38 @@ def safe_div(x, y):
     return 0.0 if y == 0 else x / y
 
 
+def build_topk_candidate_ids(base_scores, gold_ids, topk_cands):
+    """
+    base_scores: [B, N]
+    gold_ids:    [B]
+    returns candidate_ids: [B, K], where gold is always included
+    """
+    k = min(topk_cands, base_scores.size(1))
+    topk_ids = torch.topk(base_scores, k=k, dim=1).indices
+
+    rows = []
+    for i in range(topk_ids.size(0)):
+        row = topk_ids[i].tolist()
+        g = int(gold_ids[i].item())
+        if g not in row:
+            row[-1] = g
+        rows.append(row)
+
+    return torch.tensor(rows, dtype=torch.long, device=base_scores.device)
+
+
+def scatter_topk_back(full_scores, candidate_ids, adjusted_topk_scores):
+    """
+    full_scores:         [B, N]
+    candidate_ids:       [B, K]
+    adjusted_topk_scores:[B, K]
+    returns full score matrix where only top-K slots are replaced
+    """
+    out = full_scores.clone()
+    out.scatter_(1, candidate_ids, adjusted_topk_scores)
+    return out
+
+
 @torch.no_grad()
 def evaluate_model_filtered(
     model,
@@ -49,11 +81,10 @@ def evaluate_model_filtered(
     snapshot_list,
     all_ans_list,
     device,
-    batch_size=32,
+    topk_cands=256,
 ):
     model.eval()
 
-    num_entities = scores_np.shape[1]
     overall = {"MRR": 0.0, "Hits@1": 0.0, "Hits@3": 0.0, "Hits@10": 0.0, "count": 0}
     bucket_stats = defaultdict(lambda: {"MRR": 0.0, "Hits@1": 0.0, "Hits@3": 0.0, "Hits@10": 0.0, "count": 0})
     relation_error = defaultdict(lambda: {"errors": 0, "stale_repeat_errors": 0})
@@ -72,28 +103,33 @@ def evaluate_model_filtered(
         snap_scores_np = scores_np[start:end]
         snap_triples_np = triples_np[start:end]
 
-        snap_scores = torch.tensor(snap_scores_np, dtype=torch.float32, device=device)
+        full_scores = torch.tensor(snap_scores_np, dtype=torch.float32, device=device)
         snap_triples = torch.tensor(snap_triples_np, dtype=torch.long, device=device)
         rel_ids = snap_triples[:, 1]
+        gold_ids = snap_triples[:, 2]
 
-        seen_sr, dt_sr, freq_sr, seen_so, dt_so, freq_so, seen_ro, dt_ro, freq_ro = build_dense_history_features_dual(
+        candidate_ids = build_topk_candidate_ids(full_scores, gold_ids, topk_cands)
+        base_scores_topk = torch.gather(full_scores, 1, candidate_ids)
+
+        seen_sr, dt_sr, freq_sr, seen_so, dt_so, freq_so, seen_ro, dt_ro, freq_ro = build_topk_history_features_dual(
             query_triples=snap_triples_np,
+            candidate_ids=candidate_ids,
             sr_hist=sr_hist,
             so_hist=so_hist,
             ro_hist=ro_hist,
-            num_entities=num_entities,
             device=device,
         )
 
-        logits, _ = model(
-            snap_scores,
+        adjusted_topk_scores, _ = model(
+            base_scores_topk,
             rel_ids,
             seen_sr, dt_sr, freq_sr,
             seen_so, dt_so, freq_so,
             seen_ro, dt_ro, freq_ro,
         )
 
-        # Official TiRGN-style filtered ranking
+        logits = scatter_topk_back(full_scores, candidate_ids, adjusted_topk_scores)
+
         _, _, rank_raw, rank_filter = utils.get_total_rank(
             snap_triples,
             logits,
@@ -178,38 +214,44 @@ def stale_top1_interference(
     so_hist,
     ro_hist,
     device,
-    batch_size=32,
+    batch_size=64,
+    topk_cands=256,
 ):
     model.eval()
 
-    num_entities = scores_np.shape[1]
     total = 0
     stale_top1 = 0
-
     n = len(triples_np)
+
     for start in range(0, n, batch_size):
         end = min(start + batch_size, n)
 
         batch_scores = torch.tensor(scores_np[start:end], dtype=torch.float32, device=device)
         batch_triples = triples_np[start:end]
         rel_ids = torch.tensor(batch_triples[:, 1], dtype=torch.long, device=device)
+        gold_ids = torch.tensor(batch_triples[:, 2], dtype=torch.long, device=device)
 
-        seen_sr, dt_sr, freq_sr, seen_so, dt_so, freq_so, seen_ro, dt_ro, freq_ro = build_dense_history_features_dual(
+        candidate_ids = build_topk_candidate_ids(batch_scores, gold_ids, topk_cands)
+        base_scores_topk = torch.gather(batch_scores, 1, candidate_ids)
+
+        seen_sr, dt_sr, freq_sr, seen_so, dt_so, freq_so, seen_ro, dt_ro, freq_ro = build_topk_history_features_dual(
             query_triples=batch_triples,
+            candidate_ids=candidate_ids,
             sr_hist=sr_hist,
             so_hist=so_hist,
             ro_hist=ro_hist,
-            num_entities=num_entities,
             device=device,
         )
 
-        logits, _ = model(
-            batch_scores,
+        adjusted_topk_scores, _ = model(
+            base_scores_topk,
             rel_ids,
             seen_sr, dt_sr, freq_sr,
             seen_so, dt_so, freq_so,
             seen_ro, dt_ro, freq_ro,
         )
+
+        logits = scatter_topk_back(batch_scores, candidate_ids, adjusted_topk_scores)
         top1 = logits.argmax(dim=1)
 
         for i in range(logits.size(0)):
@@ -242,6 +284,7 @@ def train_calibrator(
     batch_size=64,
     lr=1e-3,
     weight_decay=1e-5,
+    topk_cands=256,
 ):
     model.train()
 
@@ -252,42 +295,46 @@ def train_calibrator(
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
     opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
-    num_entities = scores_np.shape[1]
 
     for epoch in range(epochs):
         total_loss = 0.0
         total_count = 0
 
         for batch_scores_cpu, batch_triples_cpu in loader:
-            batch_scores = batch_scores_cpu.to(device)
+            full_scores = batch_scores_cpu.to(device)
             batch_triples = batch_triples_cpu.cpu().numpy()
             rel_ids = torch.tensor(batch_triples[:, 1], dtype=torch.long, device=device)
-            gold = torch.tensor(batch_triples[:, 2], dtype=torch.long, device=device)
+            gold_ids = torch.tensor(batch_triples[:, 2], dtype=torch.long, device=device)
 
-            seen_sr, dt_sr, freq_sr, seen_so, dt_so, freq_so, seen_ro, dt_ro, freq_ro = build_dense_history_features_dual(
+            candidate_ids = build_topk_candidate_ids(full_scores, gold_ids, topk_cands)
+            base_scores_topk = torch.gather(full_scores, 1, candidate_ids)
+
+            seen_sr, dt_sr, freq_sr, seen_so, dt_so, freq_so, seen_ro, dt_ro, freq_ro = build_topk_history_features_dual(
                 query_triples=batch_triples,
+                candidate_ids=candidate_ids,
                 sr_hist=sr_hist,
                 so_hist=so_hist,
                 ro_hist=ro_hist,
-                num_entities=num_entities,
                 device=device,
             )
 
-            logits, _ = model(
-                batch_scores,
+            adjusted_topk_scores, _ = model(
+                base_scores_topk,
                 rel_ids,
                 seen_sr, dt_sr, freq_sr,
                 seen_so, dt_so, freq_so,
                 seen_ro, dt_ro, freq_ro,
             )
-            loss = F.cross_entropy(logits, gold)
+
+            local_gold = (candidate_ids == gold_ids.unsqueeze(1)).long().argmax(dim=1)
+            loss = F.cross_entropy(adjusted_topk_scores, local_gold)
 
             opt.zero_grad()
             loss.backward()
             opt.step()
 
-            total_loss += float(loss.item()) * batch_scores.size(0)
-            total_count += batch_scores.size(0)
+            total_loss += float(loss.item()) * full_scores.size(0)
+            total_count += full_scores.size(0)
 
         print(f"epoch {epoch + 1}: calibration_loss = {safe_div(total_loss, total_count):.6f}")
 
@@ -311,6 +358,7 @@ def main():
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-5)
+    parser.add_argument("--topk-cands", type=int, default=256)
     args = parser.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
@@ -322,12 +370,10 @@ def main():
     train_aug = augment_with_inverse(train_triples, args.num_rels)
     train_valid_aug = augment_with_inverse(train_triples + valid_triples, args.num_rels)
 
-    # train-only history for calibrator training and validation eval
     hist_train_sr = build_sr_history(train_aug)
     hist_train_so = build_so_history(train_aug)
     hist_train_ro = build_ro_history(train_aug)
 
-    # train+valid history for test eval
     hist_train_valid_sr = build_sr_history(train_valid_aug)
     hist_train_valid_so = build_so_history(train_valid_aug)
     hist_train_valid_ro = build_ro_history(train_valid_aug)
@@ -335,7 +381,6 @@ def main():
     valid_scores, valid_queries = load_dump(args.valid_dump)
     test_scores, test_queries = load_dump(args.test_dump)
 
-    num_entities = valid_scores.shape[1]
     num_relations = 2 * args.num_rels
 
     data = utils.load_data(args.dataset)
@@ -369,6 +414,7 @@ def main():
         batch_size=args.batch_size,
         lr=args.lr,
         weight_decay=args.weight_decay,
+        topk_cands=args.topk_cands,
     )
 
     ckpt_path = os.path.join(args.out_dir, f"rhvc_{args.mode}.pt")
@@ -386,7 +432,7 @@ def main():
         snapshot_list=valid_list,
         all_ans_list=all_ans_list_valid,
         device=device,
-        batch_size=args.batch_size,
+        topk_cands=args.topk_cands,
     )
 
     print("evaluating RHVC on test logits using train + valid history")
@@ -400,7 +446,7 @@ def main():
         snapshot_list=test_list,
         all_ans_list=all_ans_list_test,
         device=device,
-        batch_size=args.batch_size,
+        topk_cands=args.topk_cands,
     )
 
     interference = stale_top1_interference(
@@ -412,10 +458,12 @@ def main():
         ro_hist=hist_train_valid_ro,
         device=device,
         batch_size=args.batch_size,
+        topk_cands=args.topk_cands,
     )
 
     out = {
         "mode": args.mode,
+        "topk_cands": args.topk_cands,
         "valid_overall_filtered": valid_overall,
         "valid_bucket_metrics_filtered": valid_by_bucket,
         "overall_filtered": overall,
