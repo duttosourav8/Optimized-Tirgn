@@ -136,7 +136,76 @@ def build_dense_history_features_dual(
             freq_ro[i, cand_o] = float(freq_before(times, t))
 
     return seen_sr, dt_sr, freq_sr, seen_so, dt_so, freq_so, seen_ro, dt_ro, freq_ro
+def build_topk_history_features_dual(
+    query_triples,
+    candidate_ids,
+    sr_hist,
+    so_hist,
+    ro_hist,
+    device,
+):
+    """
+    Build RHVC features only for candidate_ids of shape [B, K].
 
+    query_triples:
+        numpy array or tensor of shape [B, 4]
+    candidate_ids:
+        tensor or numpy array of shape [B, K]
+    """
+    if torch.is_tensor(candidate_ids):
+        cand_np = candidate_ids.detach().cpu().numpy()
+    else:
+        cand_np = np.asarray(candidate_ids)
+
+    batch_size, k = cand_np.shape
+
+    seen_sr = torch.zeros((batch_size, k), dtype=torch.float32, device=device)
+    dt_sr   = torch.zeros((batch_size, k), dtype=torch.float32, device=device)
+    freq_sr = torch.zeros((batch_size, k), dtype=torch.float32, device=device)
+
+    seen_so = torch.zeros((batch_size, k), dtype=torch.float32, device=device)
+    dt_so   = torch.zeros((batch_size, k), dtype=torch.float32, device=device)
+    freq_so = torch.zeros((batch_size, k), dtype=torch.float32, device=device)
+
+    seen_ro = torch.zeros((batch_size, k), dtype=torch.float32, device=device)
+    dt_ro   = torch.zeros((batch_size, k), dtype=torch.float32, device=device)
+    freq_ro = torch.zeros((batch_size, k), dtype=torch.float32, device=device)
+
+    for i in range(batch_size):
+        s, r, _, t = map(int, query_triples[i])
+
+        cand_map_sr = sr_hist.get((s, r), {})
+        cand_map_so = so_hist.get(s, {})
+        cand_map_ro = ro_hist.get(r, {})
+
+        for j, cand_o in enumerate(cand_np[i]):
+            cand_o = int(cand_o)
+
+            times_sr = cand_map_sr.get(cand_o, [])
+            if times_sr:
+                lt = last_time_before(times_sr, t)
+                if lt is not None:
+                    seen_sr[i, j] = 1.0
+                    dt_sr[i, j] = float(t - lt)
+                    freq_sr[i, j] = float(freq_before(times_sr, t))
+
+            times_so = cand_map_so.get(cand_o, [])
+            if times_so:
+                lt = last_time_before(times_so, t)
+                if lt is not None:
+                    seen_so[i, j] = 1.0
+                    dt_so[i, j] = float(t - lt)
+                    freq_so[i, j] = float(freq_before(times_so, t))
+
+            times_ro = cand_map_ro.get(cand_o, [])
+            if times_ro:
+                lt = last_time_before(times_ro, t)
+                if lt is not None:
+                    seen_ro[i, j] = 1.0
+                    dt_ro[i, j] = float(t - lt)
+                    freq_ro[i, j] = float(freq_before(times_ro, t))
+
+    return seen_sr, dt_sr, freq_sr, seen_so, dt_so, freq_so, seen_ro, dt_ro, freq_ro
 def novelty_bucket_from_history(s, r, o, t, sr_hist, so_hist, ro_hist):
     times_sr = sr_hist.get((s, r), {}).get(o, [])
     lt_sr = last_time_before(times_sr, t)
