@@ -1,5 +1,6 @@
 import os
 import json
+import copy
 import argparse
 from collections import defaultdict
 
@@ -36,6 +37,46 @@ def get_augmented_snapshot_sizes(snapshot_list):
 
 def safe_div(x, y):
     return 0.0 if y == 0 else x / y
+
+
+def split_valid_dump_by_snapshots(valid_scores, valid_queries, valid_list, valid_all_ans_list, dev_frac=0.2):
+    """
+    Split validation dump by validation snapshots, not by random rows.
+    This preserves alignment with filtered evaluation.
+    """
+    if dev_frac <= 0.0 or len(valid_list) < 2:
+        return {
+            "train_scores": valid_scores,
+            "train_queries": valid_queries,
+            "train_list": valid_list,
+            "train_all_ans": valid_all_ans_list,
+            "dev_scores": None,
+            "dev_queries": None,
+            "dev_list": None,
+            "dev_all_ans": None,
+            "num_train_snaps": len(valid_list),
+            "num_dev_snaps": 0,
+        }
+
+    num_dev = max(1, int(round(len(valid_list) * dev_frac)))
+    num_dev = min(num_dev, len(valid_list) - 1)
+    num_train = len(valid_list) - num_dev
+
+    snap_sizes = get_augmented_snapshot_sizes(valid_list)
+    cut_row = sum(snap_sizes[:num_train])
+
+    return {
+        "train_scores": valid_scores[:cut_row],
+        "train_queries": valid_queries[:cut_row],
+        "train_list": valid_list[:num_train],
+        "train_all_ans": valid_all_ans_list[:num_train],
+        "dev_scores": valid_scores[cut_row:],
+        "dev_queries": valid_queries[cut_row:],
+        "dev_list": valid_list[num_train:],
+        "dev_all_ans": valid_all_ans_list[num_train:],
+        "num_train_snaps": num_train,
+        "num_dev_snaps": num_dev,
+    }
 
 
 def build_topk_candidate_ids(base_scores, gold_ids, topk_cands):
@@ -81,7 +122,7 @@ def evaluate_model_filtered(
     snapshot_list,
     all_ans_list,
     device,
-    topk_cands=256,
+    topk_cands=128,
 ):
     model.eval()
 
@@ -215,7 +256,7 @@ def stale_top1_interference(
     ro_hist,
     device,
     batch_size=64,
-    topk_cands=256,
+    topk_cands=128,
 ):
     model.eval()
 
@@ -274,29 +315,43 @@ def stale_top1_interference(
 
 def train_calibrator(
     model,
-    scores_np,
-    triples_np,
+    train_scores_np,
+    train_triples_np,
     sr_hist,
     so_hist,
     ro_hist,
     device,
-    epochs=20,
+    dev_scores_np=None,
+    dev_triples_np=None,
+    dev_snapshot_list=None,
+    dev_all_ans_list=None,
+    epochs=12,
     batch_size=64,
     lr=1e-3,
     weight_decay=1e-5,
-    topk_cands=256,
+    topk_cands=128,
+    patience=3,
+    min_epochs=4,
 ):
     model.train()
 
     dataset = TensorDataset(
-        torch.tensor(scores_np, dtype=torch.float32),
-        torch.tensor(triples_np, dtype=torch.long),
+        torch.tensor(train_scores_np, dtype=torch.float32),
+        torch.tensor(train_triples_np, dtype=torch.long),
     )
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
     opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
 
+    best_state = None
+    best_epoch = -1
+    best_dev_mrr = -1.0
+    wait = 0
+
+    history = []
+
     for epoch in range(epochs):
+        model.train()
         total_loss = 0.0
         total_count = 0
 
@@ -336,9 +391,59 @@ def train_calibrator(
             total_loss += float(loss.item()) * full_scores.size(0)
             total_count += full_scores.size(0)
 
-        print(f"epoch {epoch + 1}: calibration_loss = {safe_div(total_loss, total_count):.6f}")
+        train_loss = safe_div(total_loss, total_count)
 
-    return model
+        epoch_info = {
+            "epoch": epoch + 1,
+            "train_loss": train_loss,
+        }
+
+        if dev_scores_np is not None and dev_snapshot_list is not None and dev_all_ans_list is not None:
+            dev_overall, _, _ = evaluate_model_filtered(
+                model=model,
+                scores_np=dev_scores_np,
+                triples_np=dev_triples_np,
+                sr_hist=sr_hist,
+                so_hist=so_hist,
+                ro_hist=ro_hist,
+                snapshot_list=dev_snapshot_list,
+                all_ans_list=dev_all_ans_list,
+                device=device,
+                topk_cands=topk_cands,
+            )
+            dev_mrr = dev_overall["MRR"]
+            epoch_info["dev_mrr"] = dev_mrr
+
+            if dev_mrr > best_dev_mrr:
+                best_dev_mrr = dev_mrr
+                best_epoch = epoch + 1
+                best_state = copy.deepcopy(model.state_dict())
+                wait = 0
+            else:
+                wait += 1
+
+            print(
+                f"epoch {epoch + 1}: train_loss = {train_loss:.6f} | dev_mrr = {dev_mrr:.6f} "
+                f"| best_dev_mrr = {best_dev_mrr:.6f} | wait = {wait}"
+            )
+
+            if (epoch + 1) >= min_epochs and wait >= patience:
+                print(f"Early stopping at epoch {epoch + 1}. Best epoch was {best_epoch}.")
+                break
+        else:
+            print(f"epoch {epoch + 1}: train_loss = {train_loss:.6f}")
+
+        history.append(epoch_info)
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
+
+    summary = {
+        "best_epoch": best_epoch,
+        "best_dev_mrr": best_dev_mrr,
+        "history": history,
+    }
+    return model, summary
 
 
 def main():
@@ -354,11 +459,17 @@ def main():
 
     parser.add_argument("--mode", type=str, default="full",
                         choices=["full", "recency_only", "frequency_only"])
-    parser.add_argument("--epochs", type=int, default=20)
+    parser.add_argument("--epochs", type=int, default=12)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-5)
-    parser.add_argument("--topk-cands", type=int, default=256)
+    parser.add_argument("--topk-cands", type=int, default=128)
+
+    parser.add_argument("--dev-frac", type=float, default=0.2,
+                        help="fraction of validation snapshots reserved for dev early stopping")
+    parser.add_argument("--patience", type=int, default=3)
+    parser.add_argument("--min-epochs", type=int, default=4)
+
     args = parser.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
@@ -396,32 +507,47 @@ def main():
     all_ans_list_valid = utils.load_all_answers_for_time_filter(data.valid, base_num_rels, num_nodes, False)
     all_ans_list_test = utils.load_all_answers_for_time_filter(data.test, base_num_rels, num_nodes, False)
 
+    valid_split = split_valid_dump_by_snapshots(
+        valid_scores=valid_scores,
+        valid_queries=valid_queries,
+        valid_list=valid_list,
+        valid_all_ans_list=all_ans_list_valid,
+        dev_frac=args.dev_frac,
+    )
+
     model = RelationHistoryValidityCalibrator(
         num_relations=num_relations,
         mode=args.mode,
     ).to(device)
 
-    print("training RHVC on validation logits using train history only")
-    model = train_calibrator(
+    print("training RHVC on validation-train logits using train history only")
+    model, train_summary = train_calibrator(
         model=model,
-        scores_np=valid_scores,
-        triples_np=valid_queries,
+        train_scores_np=valid_split["train_scores"],
+        train_triples_np=valid_split["train_queries"],
         sr_hist=hist_train_sr,
         so_hist=hist_train_so,
         ro_hist=hist_train_ro,
         device=device,
+        dev_scores_np=valid_split["dev_scores"],
+        dev_triples_np=valid_split["dev_queries"],
+        dev_snapshot_list=valid_split["dev_list"],
+        dev_all_ans_list=valid_split["dev_all_ans"],
         epochs=args.epochs,
         batch_size=args.batch_size,
         lr=args.lr,
         weight_decay=args.weight_decay,
         topk_cands=args.topk_cands,
+        patience=args.patience,
+        min_epochs=args.min_epochs,
     )
 
     ckpt_path = os.path.join(args.out_dir, f"rhvc_{args.mode}.pt")
     torch.save(model.state_dict(), ckpt_path)
     print("saved calibrator to:", ckpt_path)
 
-    print("evaluating RHVC on validation logits using train history only")
+    # Full validation report after early stopping selection
+    print("evaluating RHVC on full validation logits using train history only")
     valid_overall, valid_by_bucket, _ = evaluate_model_filtered(
         model=model,
         scores_np=valid_scores,
@@ -434,6 +560,24 @@ def main():
         device=device,
         topk_cands=args.topk_cands,
     )
+
+    # Optional dev-only report
+    if valid_split["dev_scores"] is not None:
+        print("evaluating RHVC on held-out validation-dev logits using train history only")
+        dev_overall, dev_by_bucket, _ = evaluate_model_filtered(
+            model=model,
+            scores_np=valid_split["dev_scores"],
+            triples_np=valid_split["dev_queries"],
+            sr_hist=hist_train_sr,
+            so_hist=hist_train_so,
+            ro_hist=hist_train_ro,
+            snapshot_list=valid_split["dev_list"],
+            all_ans_list=valid_split["dev_all_ans"],
+            device=device,
+            topk_cands=args.topk_cands,
+        )
+    else:
+        dev_overall, dev_by_bucket = None, None
 
     print("evaluating RHVC on test logits using train + valid history")
     overall, by_bucket, rel_rows = evaluate_model_filtered(
@@ -464,8 +608,14 @@ def main():
     out = {
         "mode": args.mode,
         "topk_cands": args.topk_cands,
+        "dev_frac": args.dev_frac,
+        "num_valid_train_snapshots": valid_split["num_train_snaps"],
+        "num_valid_dev_snapshots": valid_split["num_dev_snaps"],
+        "training_summary": train_summary,
         "valid_overall_filtered": valid_overall,
         "valid_bucket_metrics_filtered": valid_by_bucket,
+        "dev_overall_filtered": dev_overall,
+        "dev_bucket_metrics_filtered": dev_by_bucket,
         "overall_filtered": overall,
         "bucket_metrics_filtered": by_bucket,
         "stale_top1_interference": interference,
