@@ -3,7 +3,8 @@ import json
 import os
 import random
 import sys
-from typing import Dict, List
+from collections import OrderedDict
+from typing import Dict
 
 import numpy as np
 import scipy.sparse as sp
@@ -54,14 +55,20 @@ def build_hva_histories(data, num_rels):
 
 class SparseHistoryMatrixCache:
     """
-    Lazily loads sparse history matrices on first use and keeps them cached.
-    Prevents repeated sp.load_npz(...) inside train/test loops.
+    LRU-bounded sparse history cache.
+    This keeps the original method semantics but prevents RAM growth from caching
+    every timestamp forever.
     """
 
-    def __init__(self, dataset: str):
+    def __init__(self, dataset: str, max_size: int = 24):
         self.history_dir = os.path.join("..", "data", dataset, "history")
-        self.tail_cache: Dict[int, sp.csr_matrix] = {}
-        self.rel_cache: Dict[int, sp.csr_matrix] = {}
+        self.tail_cache: "OrderedDict[int, sp.csr_matrix]" = OrderedDict()
+        self.rel_cache: "OrderedDict[int, sp.csr_matrix]" = OrderedDict()
+        self.max_size = int(max_size)
+
+    def _evict_if_needed(self, cache: OrderedDict):
+        while len(cache) > self.max_size:
+            cache.popitem(last=False)
 
     def _load_sparse(self, kind: str, timestamp: int):
         timestamp = int(timestamp)
@@ -74,10 +81,14 @@ class SparseHistoryMatrixCache:
         else:
             raise ValueError(f"Unknown sparse history kind: {kind}")
 
-        if timestamp not in cache:
-            path = os.path.join(self.history_dir, filename)
-            cache[timestamp] = sp.load_npz(path).tocsr()
+        if timestamp in cache:
+            cache.move_to_end(timestamp)
+            return cache[timestamp]
 
+        path = os.path.join(self.history_dir, filename)
+        cache[timestamp] = sp.load_npz(path).tocsr()
+        cache.move_to_end(timestamp)
+        self._evict_if_needed(cache)
         return cache[timestamp]
 
     def get_one_hot_sequences(self, histroy_data_np, timestamp: int, num_nodes: int, num_rels: int, use_cuda: bool, gpu: int):
@@ -100,23 +111,45 @@ class SparseHistoryMatrixCache:
         return one_hot_tail_seq, one_hot_rel_seq
 
 
-class LazyGraphCache:
+class BoundedGraphCache:
     """
-    Lazily builds subgraphs only when a timestamp is actually requested.
-    This avoids the RAM spike from eagerly prebuilding all train/valid/test graphs.
+    LRU-bounded graph cache.
+    Only used for HVA runs. Baseline stays on original on-demand graph path.
     """
 
-    def __init__(self, num_nodes: int, num_rels: int, gpu: int):
+    def __init__(self, num_nodes: int, num_rels: int, gpu: int, max_size: int = 24):
         self.num_nodes = num_nodes
         self.num_rels = num_rels
         self.gpu = gpu
-        self.cache: Dict[int, object] = {}
+        self.max_size = int(max_size)
+        self.cache: "OrderedDict[int, object]" = OrderedDict()
 
     def get(self, ts: int, snap):
         ts = int(ts)
-        if ts not in self.cache:
-            self.cache[ts] = build_sub_graph(self.num_nodes, self.num_rels, snap, False, self.gpu)
-        return self.cache[ts]
+        if ts in self.cache:
+            self.cache.move_to_end(ts)
+            return self.cache[ts]
+
+        g = build_sub_graph(self.num_nodes, self.num_rels, snap, False, self.gpu)
+        self.cache[ts] = g
+        self.cache.move_to_end(ts)
+
+        while len(self.cache) > self.max_size:
+            self.cache.popitem(last=False)
+
+        return g
+
+
+def build_history_glist_from_times(time_ids, snap_map, num_nodes, num_rels, use_cuda, gpu, graph_cache=None):
+    if graph_cache is None:
+        return [
+            build_sub_graph(num_nodes, num_rels, snap_map[int(ts)], use_cuda, gpu)
+            for ts in time_ids
+        ]
+    return [
+        graph_cache.get(int(ts), snap_map[int(ts)])
+        for ts in time_ids
+    ]
 
 
 def test(
@@ -172,7 +205,15 @@ def test(
                 for g in input_list
             ]
         else:
-            history_glist = [graph_cache.get(int(ts), snap_map[int(ts)]) for ts in input_time_list]
+            history_glist = build_history_glist_from_times(
+                time_ids=input_time_list,
+                snap_map=snap_map,
+                num_nodes=num_nodes,
+                num_rels=num_rels,
+                use_cuda=use_cuda,
+                gpu=args.gpu,
+                graph_cache=graph_cache,
+            )
 
         test_triples_input = torch.LongTensor(test_snap)
         if use_cuda:
@@ -321,8 +362,17 @@ def run_experiment(args):
     all_snap_map.update(valid_snap_map)
     all_snap_map.update(test_snap_map)
 
-    graph_cache = LazyGraphCache(num_nodes=num_nodes, num_rels=num_rels, gpu=args.gpu)
-    sequence_cache = SparseHistoryMatrixCache(args.dataset)
+    # Baseline path stays clean/native: no graph cache.
+    # HVA path gets bounded graph caching.
+    graph_cache = BoundedGraphCache(
+        num_nodes=num_nodes,
+        num_rels=num_rels,
+        gpu=args.gpu,
+        max_size=args.graph_cache_size,
+    ) if args.use_history_gate else None
+
+    # Sparse sequence cache is safe for both baseline and HVA, but bounded.
+    sequence_cache = SparseHistoryMatrixCache(args.dataset, max_size=args.sparse_cache_size)
 
     if args.add_static_graph:
         static_triples = np.array(
@@ -509,7 +559,15 @@ def run_experiment(args):
             else:
                 input_time_list = [int(ts) for ts in train_times[train_sample_num - args.train_history_len: train_sample_num]]
 
-            history_glist = [graph_cache.get(int(ts), all_snap_map[int(ts)]) for ts in input_time_list]
+            history_glist = build_history_glist_from_times(
+                time_ids=input_time_list,
+                snap_map=all_snap_map,
+                num_nodes=num_nodes,
+                num_rels=num_rels,
+                use_cuda=use_cuda,
+                gpu=args.gpu,
+                graph_cache=graph_cache,
+            )
 
             output_np = train_list[train_sample_num]
             if use_cuda:
@@ -742,6 +800,9 @@ if __name__ == "__main__":
     parser.add_argument("--hva-gamma-exact", type=float, default=0.005)
     parser.add_argument("--hva-gamma-near", type=float, default=0.08)
     parser.add_argument("--hva-stale-init", type=float, default=0.2)
+
+    parser.add_argument("--graph-cache-size", type=int, default=24)
+    parser.add_argument("--sparse-cache-size", type=int, default=24)
 
     args = parser.parse_args()
     print(args)
