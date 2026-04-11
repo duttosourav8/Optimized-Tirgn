@@ -3,6 +3,7 @@ import json
 import copy
 import random
 import argparse
+import inspect
 from collections import defaultdict
 
 import numpy as np
@@ -40,6 +41,31 @@ except ImportError:
         stale_exact_bucket,
         RelationHistoryValidityCalibrator,
     )
+
+
+def verify_calibrator_import():
+    sig = inspect.signature(RelationHistoryValidityCalibrator.__init__)
+    required = [
+        "num_relations",
+        "mode",
+        "rel_emb_dim",
+        "hidden_dim",
+        "dropout",
+        "init_gamma_exact",
+        "init_gamma_near",
+        "stale_init",
+        "init_base_scale",
+        "max_bias",
+        "use_score_mlp",
+        "use_uncertainty_gate",
+    ]
+    missing = [k for k in required if k not in sig.parameters]
+    if missing:
+        source = inspect.getsourcefile(RelationHistoryValidityCalibrator)
+        raise RuntimeError(
+            f"Imported RelationHistoryValidityCalibrator from {source}, but it is missing constructor args: {missing}. "
+            "This usually means an old or duplicated class definition is shadowing the intended stronger version."
+        )
 
 
 def set_seed(seed: int):
@@ -566,6 +592,7 @@ def main():
 
     args = parser.parse_args()
 
+    verify_calibrator_import()
     set_seed(args.seed)
     os.makedirs(args.out_dir, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -656,7 +683,6 @@ def main():
     torch.save(model.state_dict(), ckpt_path)
     print("saved calibrator to:", ckpt_path)
 
-    # Base metrics
     valid_base_overall, valid_base_bucket, valid_base_rel = evaluate_scores_filtered(
         scores_np=valid_scores,
         triples_np=valid_queries,
@@ -693,7 +719,6 @@ def main():
         ro_hist=hist_train_valid_ro,
     )
 
-    # Calibrated metrics
     print("evaluating calibrated RHVC on full validation logits using train history only")
     valid_adjusted_scores, valid_overall, valid_by_bucket, valid_rel_rows = evaluate_model_filtered(
         model=model,
