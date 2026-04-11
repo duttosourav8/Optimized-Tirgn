@@ -2,7 +2,8 @@ import bisect
 from collections import defaultdict
 from typing import Dict, List, Tuple
 
-import numpy as npimport bisect
+import numpy as np
+import bisect
 import math
 from collections import defaultdict
 from typing import Dict, List, Tuple
