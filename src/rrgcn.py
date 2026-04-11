@@ -1,10 +1,9 @@
-# /content/Optimized-Tirgn/src/rrgcn.py
 import math
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import numpy as np
 
 from rgcn.layers import UnionRGCNLayer, RGCNBlockLayer
 from src.model import BaseRGCN
@@ -253,18 +252,15 @@ class RecurrentRGCN(nn.Module):
             static_emb = None
 
         history_embs = []
+        device = self.emb_rel.device
 
         for i, g in enumerate(g_list):
             g = g.to(self.gpu)
             temp_e = self.h[g.r_to_e]
-            x_input = (
-                torch.zeros(self.num_rels * 2, self.h_dim).float().cuda()
-                if use_cuda
-                else torch.zeros(self.num_rels * 2, self.h_dim).float()
-            )
+            x_input = torch.zeros(self.num_rels * 2, self.h_dim, device=device, dtype=torch.float32)
 
             for span, r_idx in zip(g.r_len, g.uniq_r):
-                x = temp_e[span[0] : span[1], :]
+                x = temp_e[span[0]: span[1], :]
                 x_mean = torch.mean(x, dim=0, keepdim=True)
                 x_input[r_idx] = x_mean
 
@@ -290,19 +286,22 @@ class RecurrentRGCN(nn.Module):
             return entity_log_scores
 
         gold_ids = all_triples[:, 2]
-        candidate_ids = build_topk_candidate_ids(entity_log_scores, gold_ids, self.hva_topk)
+        rel_ids = all_triples[:, 1]
+
+        with torch.no_grad():
+            candidate_ids = build_topk_candidate_ids(entity_log_scores, gold_ids, self.hva_topk)
+            seen_sr, dt_sr, freq_sr, seen_so, dt_so, freq_so, seen_ro, dt_ro, freq_ro = build_topk_history_features_dual(
+                query_triples=all_triples,
+                candidate_ids=candidate_ids,
+                sr_hist=hva_histories["sr"],
+                so_hist=hva_histories["so"],
+                ro_hist=hva_histories["ro"],
+                device=entity_log_scores.device,
+                mode=self.hva_mode,
+            )
+
         base_scores_topk = torch.gather(entity_log_scores, 1, candidate_ids)
 
-        seen_sr, dt_sr, freq_sr, seen_so, dt_so, freq_so, seen_ro, dt_ro, freq_ro = build_topk_history_features_dual(
-            query_triples=all_triples,
-            candidate_ids=candidate_ids,
-            sr_hist=hva_histories["sr"],
-            so_hist=hva_histories["so"],
-            ro_hist=hva_histories["ro"],
-            device=entity_log_scores.device,
-        )
-
-        rel_ids = all_triples[:, 1]
         adjusted_topk_scores, _ = self.history_validity_adapter(
             base_scores_topk,
             rel_ids,
@@ -360,14 +359,14 @@ class RecurrentRGCN(nn.Module):
         hva_histories=None,
     ):
         self.use_cuda = use_cuda
-        loss_ent = torch.zeros(1).cuda().to(self.gpu) if use_cuda else torch.zeros(1)
-        loss_rel = torch.zeros(1).cuda().to(self.gpu) if use_cuda else torch.zeros(1)
-        loss_static = torch.zeros(1).cuda().to(self.gpu) if use_cuda else torch.zeros(1)
+        device = self.emb_rel.device
+        loss_ent = torch.zeros(1, device=device)
+        loss_rel = torch.zeros(1, device=device)
+        loss_static = torch.zeros(1, device=device)
 
         inverse_triples = triples[:, [2, 1, 0, 3]]
         inverse_triples[:, 1] = inverse_triples[:, 1] + self.num_rels
-        all_triples = torch.cat([triples, inverse_triples])
-        all_triples = all_triples.to(self.gpu)
+        all_triples = torch.cat([triples, inverse_triples]).to(self.gpu)
 
         evolve_embs, static_emb, r_emb, _, _ = self.forward(glist, static_graph, use_cuda)
         pre_emb = F.normalize(evolve_embs[-1]) if self.layer_norm else evolve_embs[-1]
@@ -430,10 +429,11 @@ class RecurrentRGCN(nn.Module):
         return F.softmax(scores_ob, dim=1)
 
     def history_mode(self, pre_emb, r_emb, time_embs, all_triples, history_vocabulary):
+        global_index = history_vocabulary.float()
         if self.use_cuda:
-            global_index = torch.Tensor(np.array(history_vocabulary.cpu(), dtype=float)).to("cuda")
+            global_index = global_index.to(self.gpu, non_blocking=True)
         else:
-            global_index = torch.Tensor(np.array(history_vocabulary.cpu(), dtype=float))
+            global_index = global_index.cpu()
         score_global = self.decoder_ob2.forward(pre_emb, r_emb, time_embs, all_triples, partial_embeding=global_index)
         return F.softmax(score_global, dim=1)
 
@@ -442,9 +442,10 @@ class RecurrentRGCN(nn.Module):
         return F.softmax(scores_re, dim=1)
 
     def rel_history_mode(self, pre_emb, r_emb, time_embs, all_triples, history_vocabulary):
+        global_index = history_vocabulary.float()
         if self.use_cuda:
-            global_index = torch.Tensor(np.array(history_vocabulary.cpu(), dtype=float)).to("cuda")
+            global_index = global_index.to(self.gpu, non_blocking=True)
         else:
-            global_index = torch.Tensor(np.array(history_vocabulary.cpu(), dtype=float))
+            global_index = global_index.cpu()
         score_global = self.rdecoder_re2.forward(pre_emb, r_emb, time_embs, all_triples, partial_embeding=global_index)
         return F.softmax(score_global, dim=1)
