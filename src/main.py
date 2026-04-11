@@ -1,9 +1,9 @@
-# /content/Optimized-Tirgn/src/main.py
 import argparse
 import json
 import os
 import random
 import sys
+from typing import Dict, List
 
 import numpy as np
 import scipy.sparse as sp
@@ -52,10 +52,63 @@ def build_hva_histories(data, num_rels):
     return train_hist, train_valid_hist
 
 
+class SparseHistoryMatrixCache:
+    def __init__(self, dataset: str):
+        self.history_dir = os.path.join("..", "data", dataset, "history")
+        self.tail_cache: Dict[int, sp.csr_matrix] = {}
+        self.rel_cache: Dict[int, sp.csr_matrix] = {}
+
+    def _load_sparse(self, kind: str, timestamp: int):
+        timestamp = int(timestamp)
+        if kind == "tail":
+            cache = self.tail_cache
+            filename = f"tail_history_{timestamp}.npz"
+        elif kind == "rel":
+            cache = self.rel_cache
+            filename = f"rel_history_{timestamp}.npz"
+        else:
+            raise ValueError(f"Unknown sparse history kind: {kind}")
+
+        if timestamp not in cache:
+            path = os.path.join(self.history_dir, filename)
+            cache[timestamp] = sp.load_npz(path).tocsr()
+        return cache[timestamp]
+
+    def get_one_hot_sequences(self, histroy_data_np, timestamp: int, num_nodes: int, num_rels: int, use_cuda: bool, gpu: int):
+        timestamp = int(timestamp)
+
+        all_tail_seq = self._load_sparse("tail", timestamp)
+        seq_idx = histroy_data_np[:, 0] * num_rels * 2 + histroy_data_np[:, 1]
+        tail_seq = torch.from_numpy(np.asarray(all_tail_seq[seq_idx].todense(), dtype=np.float32))
+        one_hot_tail_seq = tail_seq.masked_fill(tail_seq != 0, 1)
+
+        all_rel_seq = self._load_sparse("rel", timestamp)
+        rel_seq_idx = histroy_data_np[:, 0] * num_nodes + histroy_data_np[:, 2]
+        rel_seq = torch.from_numpy(np.asarray(all_rel_seq[rel_seq_idx].todense(), dtype=np.float32))
+        one_hot_rel_seq = rel_seq.masked_fill(rel_seq != 0, 1)
+
+        if use_cuda:
+            one_hot_tail_seq = one_hot_tail_seq.cuda(gpu, non_blocking=True)
+            one_hot_rel_seq = one_hot_rel_seq.cuda(gpu, non_blocking=True)
+
+        return one_hot_tail_seq, one_hot_rel_seq
+
+
+def build_subgraph_cache(snapshot_list: List[np.ndarray], time_list: List[int], num_nodes: int, num_rels: int, gpu: int):
+    cache = {}
+    for snap, ts in zip(snapshot_list, time_list):
+        ts = int(ts)
+        if ts not in cache:
+            cache[ts] = build_sub_graph(num_nodes, num_rels, snap, False, gpu)
+    return cache
+
+
 def test(
     model,
     history_list,
+    history_times,
     test_list,
+    test_times,
     num_rels,
     num_nodes,
     use_cuda,
@@ -63,11 +116,12 @@ def test(
     all_ans_r_list,
     ckpt_path,
     static_graph,
-    time_list,
     history_time_nogt,
     mode,
     args,
     hva_histories=None,
+    graph_cache=None,
+    sequence_cache=None,
 ):
     ranks_raw, ranks_filter, mrr_raw_list, mrr_filter_list = [], [], [], []
     ranks_raw_r, ranks_filter_r, mrr_raw_list_r, mrr_filter_list_r = [], [], [], []
@@ -84,17 +138,24 @@ def test(
         model.load_state_dict(checkpoint["state_dict"])
 
     model.eval()
-    input_list = [snap for snap in history_list[-args.test_history_len:]]
 
     if args.multi_step:
-        all_tail_seq = sp.load_npz(f"../data/{args.dataset}/history/tail_history_{history_time_nogt}.npz")
-        all_rel_seq = sp.load_npz(f"../data/{args.dataset}/history/rel_history_{history_time_nogt}.npz")
+        input_list = [snap for snap in history_list[-args.test_history_len:]]
+        all_tail_seq = sequence_cache._load_sparse("tail", int(history_time_nogt))
+        all_rel_seq = sequence_cache._load_sparse("rel", int(history_time_nogt))
+    else:
+        input_time_list = [int(ts) for ts in history_times[-args.test_history_len:]]
 
     for time_idx, test_snap in enumerate(tqdm(test_list)):
-        history_glist = [
-            build_sub_graph(num_nodes, num_rels, g, use_cuda, args.gpu)
-            for g in input_list
-        ]
+        current_ts = int(test_times[time_idx])
+
+        if args.multi_step:
+            history_glist = [
+                build_sub_graph(num_nodes, num_rels, g, use_cuda, args.gpu)
+                for g in input_list
+            ]
+        else:
+            history_glist = [graph_cache[int(ts)] for ts in input_time_list]
 
         test_triples_input = torch.LongTensor(test_snap)
         if use_cuda:
@@ -103,30 +164,29 @@ def test(
         histroy_data = test_triples_input
         inverse_histroy_data = histroy_data[:, [2, 1, 0, 3]]
         inverse_histroy_data[:, 1] = inverse_histroy_data[:, 1] + num_rels
-        histroy_data = torch.cat([histroy_data, inverse_histroy_data]).cpu().numpy()
+        histroy_data_np = torch.cat([histroy_data, inverse_histroy_data]).cpu().numpy()
 
         if args.multi_step:
-            seq_idx = histroy_data[:, 0] * num_rels * 2 + histroy_data[:, 1]
-            tail_seq = torch.Tensor(all_tail_seq[seq_idx].todense())
+            seq_idx = histroy_data_np[:, 0] * num_rels * 2 + histroy_data_np[:, 1]
+            tail_seq = torch.from_numpy(np.asarray(all_tail_seq[seq_idx].todense(), dtype=np.float32))
             one_hot_tail_seq = tail_seq.masked_fill(tail_seq != 0, 1)
 
-            rel_seq_idx = histroy_data[:, 0] * num_nodes + histroy_data[:, 2]
-            rel_seq = torch.Tensor(all_rel_seq[rel_seq_idx].todense())
+            rel_seq_idx = histroy_data_np[:, 0] * num_nodes + histroy_data_np[:, 2]
+            rel_seq = torch.from_numpy(np.asarray(all_rel_seq[rel_seq_idx].todense(), dtype=np.float32))
             one_hot_rel_seq = rel_seq.masked_fill(rel_seq != 0, 1)
+
+            if use_cuda:
+                one_hot_tail_seq = one_hot_tail_seq.cuda(args.gpu, non_blocking=True)
+                one_hot_rel_seq = one_hot_rel_seq.cuda(args.gpu, non_blocking=True)
         else:
-            all_tail_seq = sp.load_npz(f"../data/{args.dataset}/history/tail_history_{time_list[time_idx]}.npz")
-            seq_idx = histroy_data[:, 0] * num_rels * 2 + histroy_data[:, 1]
-            tail_seq = torch.Tensor(all_tail_seq[seq_idx].todense())
-            one_hot_tail_seq = tail_seq.masked_fill(tail_seq != 0, 1)
-
-            all_rel_seq = sp.load_npz(f"../data/{args.dataset}/history/rel_history_{time_list[time_idx]}.npz")
-            rel_seq_idx = histroy_data[:, 0] * num_nodes + histroy_data[:, 2]
-            rel_seq = torch.Tensor(all_rel_seq[rel_seq_idx].todense())
-            one_hot_rel_seq = rel_seq.masked_fill(rel_seq != 0, 1)
-
-        if use_cuda:
-            one_hot_tail_seq = one_hot_tail_seq.cuda(args.gpu)
-            one_hot_rel_seq = one_hot_rel_seq.cuda(args.gpu)
+            one_hot_tail_seq, one_hot_rel_seq = sequence_cache.get_one_hot_sequences(
+                histroy_data_np,
+                current_ts,
+                num_nodes,
+                num_rels,
+                use_cuda,
+                args.gpu,
+            )
 
         test_triples, final_score, final_r_score = model.predict(
             history_glist,
@@ -169,8 +229,8 @@ def test(
                 input_list.pop(0)
                 input_list.append(predicted_snap)
         else:
-            input_list.pop(0)
-            input_list.append(test_snap)
+            input_time_list.pop(0)
+            input_time_list.append(current_ts)
 
     mrr_raw, hit_result_raw = utils.stat_ranks(ranks_raw, "raw_ent")
     mrr_filter, hit_result_filter = utils.stat_ranks(ranks_filter, "filter_ent")
@@ -216,8 +276,8 @@ def run_experiment(args):
     all_ans_list_valid = utils.load_all_answers_for_time_filter(data.valid, num_rels, num_nodes, False)
     all_ans_list_r_valid = utils.load_all_answers_for_time_filter(data.valid, num_rels, num_nodes, True)
 
-    history_val_time_nogt = valid_times[0]
-    history_test_time_nogt = test_times[0]
+    history_val_time_nogt = int(valid_times[0])
+    history_test_time_nogt = int(test_times[0])
 
     model_name = "gl_rate_{}-{}-{}-{}-ly{}-dilate{}-his{}-weight_{}-discount_{}-angle_{}-dp{}_{}_{}_{}-gpu{}-{}".format(
         args.history_rate, args.dataset, args.encoder, args.decoder, args.n_layers,
@@ -235,6 +295,13 @@ def run_experiment(args):
 
     print("Checkpoint used:", load_ckpt_path)
     use_cuda = args.gpu >= 0 and torch.cuda.is_available()
+
+    graph_cache = {}
+    graph_cache.update(build_subgraph_cache(train_list, train_times, num_nodes, num_rels, args.gpu))
+    graph_cache.update(build_subgraph_cache(valid_list, valid_times, num_nodes, num_rels, args.gpu))
+    graph_cache.update(build_subgraph_cache(test_list, test_times, num_nodes, num_rels, args.gpu))
+
+    sequence_cache = SparseHistoryMatrixCache(args.dataset)
 
     if args.add_static_graph:
         static_triples = np.array(
@@ -339,7 +406,9 @@ def run_experiment(args):
         return test(
             model,
             train_list,
+            train_times,
             valid_list,
+            valid_times,
             num_rels,
             num_nodes,
             use_cuda,
@@ -347,18 +416,21 @@ def run_experiment(args):
             all_ans_list_r_valid,
             load_ckpt_path,
             static_graph,
-            valid_times,
             history_val_time_nogt,
             mode="test",
             args=args,
             hva_histories=hva_hist_train,
+            graph_cache=graph_cache,
+            sequence_cache=sequence_cache,
         )
 
     if args.eval_mode == "dump_test":
         return test(
             model,
             train_list + valid_list,
+            list(train_times) + list(valid_times),
             test_list,
+            test_times,
             num_rels,
             num_nodes,
             use_cuda,
@@ -366,18 +438,21 @@ def run_experiment(args):
             all_ans_list_r_test,
             load_ckpt_path,
             static_graph,
-            test_times,
             history_test_time_nogt,
             mode="test",
             args=args,
             hva_histories=hva_hist_train_valid,
+            graph_cache=graph_cache,
+            sequence_cache=sequence_cache,
         )
 
     if args.test:
         return test(
             model,
             train_list + valid_list,
+            list(train_times) + list(valid_times),
             test_list,
+            test_times,
             num_rels,
             num_nodes,
             use_cuda,
@@ -385,11 +460,12 @@ def run_experiment(args):
             all_ans_list_r_test,
             load_ckpt_path,
             static_graph,
-            test_times,
             history_test_time_nogt,
             mode="test",
             args=args,
             hva_histories=hva_hist_train_valid,
+            graph_cache=graph_cache,
+            sequence_cache=sequence_cache,
         )
 
     print("---------------------------------------- start training ----------------------------------------")
@@ -404,45 +480,36 @@ def run_experiment(args):
             if train_sample_num == 0:
                 continue
 
-            output = train_list[train_sample_num : train_sample_num + 1]
-
             if train_sample_num - args.train_history_len < 0:
-                input_list = train_list[0:train_sample_num]
+                input_time_list = train_times[0:train_sample_num]
             else:
-                input_list = train_list[train_sample_num - args.train_history_len : train_sample_num]
+                input_time_list = train_times[train_sample_num - args.train_history_len: train_sample_num]
 
-            history_glist = [
-                build_sub_graph(num_nodes, num_rels, snap, use_cuda, args.gpu)
-                for snap in input_list
-            ]
+            history_glist = [graph_cache[int(ts)] for ts in input_time_list]
 
+            output_np = train_list[train_sample_num]
             if use_cuda:
-                output = [torch.from_numpy(_).long().cuda(args.gpu) for _ in output]
+                output = torch.from_numpy(output_np).long().cuda(args.gpu)
             else:
-                output = [torch.from_numpy(_).long() for _ in output]
+                output = torch.from_numpy(output_np).long()
 
-            histroy_data = output[0]
+            histroy_data = output
             inverse_histroy_data = histroy_data[:, [2, 1, 0, 3]]
             inverse_histroy_data[:, 1] = inverse_histroy_data[:, 1] + num_rels
-            histroy_data = torch.cat([histroy_data, inverse_histroy_data]).cpu().numpy()
+            histroy_data_np = torch.cat([histroy_data, inverse_histroy_data]).cpu().numpy()
 
-            all_tail_seq = sp.load_npz(f"../data/{args.dataset}/history/tail_history_{train_times[train_sample_num]}.npz")
-            seq_idx = histroy_data[:, 0] * num_rels * 2 + histroy_data[:, 1]
-            tail_seq = torch.Tensor(all_tail_seq[seq_idx].todense())
-            one_hot_tail_seq = tail_seq.masked_fill(tail_seq != 0, 1)
-
-            all_rel_seq = sp.load_npz(f"../data/{args.dataset}/history/rel_history_{train_times[train_sample_num]}.npz")
-            rel_seq_idx = histroy_data[:, 0] * num_nodes + histroy_data[:, 2]
-            rel_seq = torch.Tensor(all_rel_seq[rel_seq_idx].todense())
-            one_hot_rel_seq = rel_seq.masked_fill(rel_seq != 0, 1)
-
-            if use_cuda:
-                one_hot_tail_seq = one_hot_tail_seq.cuda(args.gpu)
-                one_hot_rel_seq = one_hot_rel_seq.cuda(args.gpu)
+            one_hot_tail_seq, one_hot_rel_seq = sequence_cache.get_one_hot_sequences(
+                histroy_data_np,
+                int(train_times[train_sample_num]),
+                num_nodes,
+                num_rels,
+                use_cuda,
+                args.gpu,
+            )
 
             loss_e, loss_r, loss_static = model.get_loss(
                 history_glist,
-                output[0],
+                output,
                 static_graph,
                 one_hot_tail_seq,
                 one_hot_rel_seq,
@@ -457,10 +524,10 @@ def run_experiment(args):
             losses_r.append(loss_r.item())
             losses_static.append(loss_static.item())
 
+            optimizer.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_norm)
             optimizer.step()
-            optimizer.zero_grad()
 
         epoch_row = {
             "epoch": epoch,
@@ -489,7 +556,9 @@ def run_experiment(args):
             _, mrr_filter, _, mrr_filter_r, _, _, _, _ = test(
                 model,
                 train_list,
+                train_times,
                 valid_list,
+                valid_times,
                 num_rels,
                 num_nodes,
                 use_cuda,
@@ -497,11 +566,12 @@ def run_experiment(args):
                 all_ans_list_r_valid,
                 model_state_file,
                 static_graph,
-                valid_times,
                 history_val_time_nogt,
                 mode="train",
                 args=args,
                 hva_histories=hva_hist_train,
+                graph_cache=graph_cache,
+                sequence_cache=sequence_cache,
             )
 
             current_mrr = mrr_filter if not args.relation_evaluation else mrr_filter_r
@@ -559,7 +629,9 @@ def run_experiment(args):
     return test(
         model,
         train_list + valid_list,
+        list(train_times) + list(valid_times),
         test_list,
+        test_times,
         num_rels,
         num_nodes,
         use_cuda,
@@ -567,11 +639,12 @@ def run_experiment(args):
         all_ans_list_r_test,
         final_eval_ckpt,
         static_graph,
-        test_times,
         history_test_time_nogt,
         mode="test",
         args=args,
         hva_histories=hva_hist_train_valid,
+        graph_cache=graph_cache,
+        sequence_cache=sequence_cache,
     )
 
 
