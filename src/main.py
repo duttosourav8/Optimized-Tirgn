@@ -53,6 +53,11 @@ def build_hva_histories(data, num_rels):
 
 
 class SparseHistoryMatrixCache:
+    """
+    Lazily loads sparse history matrices on first use and keeps them cached.
+    Prevents repeated sp.load_npz(...) inside train/test loops.
+    """
+
     def __init__(self, dataset: str):
         self.history_dir = os.path.join("..", "data", dataset, "history")
         self.tail_cache: Dict[int, sp.csr_matrix] = {}
@@ -72,6 +77,7 @@ class SparseHistoryMatrixCache:
         if timestamp not in cache:
             path = os.path.join(self.history_dir, filename)
             cache[timestamp] = sp.load_npz(path).tocsr()
+
         return cache[timestamp]
 
     def get_one_hot_sequences(self, histroy_data_np, timestamp: int, num_nodes: int, num_rels: int, use_cuda: bool, gpu: int):
@@ -94,13 +100,23 @@ class SparseHistoryMatrixCache:
         return one_hot_tail_seq, one_hot_rel_seq
 
 
-def build_subgraph_cache(snapshot_list: List[np.ndarray], time_list: List[int], num_nodes: int, num_rels: int, gpu: int):
-    cache = {}
-    for snap, ts in zip(snapshot_list, time_list):
+class LazyGraphCache:
+    """
+    Lazily builds subgraphs only when a timestamp is actually requested.
+    This avoids the RAM spike from eagerly prebuilding all train/valid/test graphs.
+    """
+
+    def __init__(self, num_nodes: int, num_rels: int, gpu: int):
+        self.num_nodes = num_nodes
+        self.num_rels = num_rels
+        self.gpu = gpu
+        self.cache: Dict[int, object] = {}
+
+    def get(self, ts: int, snap):
         ts = int(ts)
-        if ts not in cache:
-            cache[ts] = build_sub_graph(num_nodes, num_rels, snap, False, gpu)
-    return cache
+        if ts not in self.cache:
+            self.cache[ts] = build_sub_graph(self.num_nodes, self.num_rels, snap, False, self.gpu)
+        return self.cache[ts]
 
 
 def test(
@@ -122,6 +138,7 @@ def test(
     hva_histories=None,
     graph_cache=None,
     sequence_cache=None,
+    snap_map=None,
 ):
     ranks_raw, ranks_filter, mrr_raw_list, mrr_filter_list = [], [], [], []
     ranks_raw_r, ranks_filter_r, mrr_raw_list_r, mrr_filter_list_r = [], [], [], []
@@ -155,7 +172,7 @@ def test(
                 for g in input_list
             ]
         else:
-            history_glist = [graph_cache[int(ts)] for ts in input_time_list]
+            history_glist = [graph_cache.get(int(ts), snap_map[int(ts)]) for ts in input_time_list]
 
         test_triples_input = torch.LongTensor(test_snap)
         if use_cuda:
@@ -296,11 +313,15 @@ def run_experiment(args):
     print("Checkpoint used:", load_ckpt_path)
     use_cuda = args.gpu >= 0 and torch.cuda.is_available()
 
-    graph_cache = {}
-    graph_cache.update(build_subgraph_cache(train_list, train_times, num_nodes, num_rels, args.gpu))
-    graph_cache.update(build_subgraph_cache(valid_list, valid_times, num_nodes, num_rels, args.gpu))
-    graph_cache.update(build_subgraph_cache(test_list, test_times, num_nodes, num_rels, args.gpu))
+    train_snap_map = {int(ts): snap for snap, ts in zip(train_list, train_times)}
+    valid_snap_map = {int(ts): snap for snap, ts in zip(valid_list, valid_times)}
+    test_snap_map = {int(ts): snap for snap, ts in zip(test_list, test_times)}
+    all_snap_map = {}
+    all_snap_map.update(train_snap_map)
+    all_snap_map.update(valid_snap_map)
+    all_snap_map.update(test_snap_map)
 
+    graph_cache = LazyGraphCache(num_nodes=num_nodes, num_rels=num_rels, gpu=args.gpu)
     sequence_cache = SparseHistoryMatrixCache(args.dataset)
 
     if args.add_static_graph:
@@ -422,6 +443,7 @@ def run_experiment(args):
             hva_histories=hva_hist_train,
             graph_cache=graph_cache,
             sequence_cache=sequence_cache,
+            snap_map=all_snap_map,
         )
 
     if args.eval_mode == "dump_test":
@@ -444,6 +466,7 @@ def run_experiment(args):
             hva_histories=hva_hist_train_valid,
             graph_cache=graph_cache,
             sequence_cache=sequence_cache,
+            snap_map=all_snap_map,
         )
 
     if args.test:
@@ -466,6 +489,7 @@ def run_experiment(args):
             hva_histories=hva_hist_train_valid,
             graph_cache=graph_cache,
             sequence_cache=sequence_cache,
+            snap_map=all_snap_map,
         )
 
     print("---------------------------------------- start training ----------------------------------------")
@@ -481,11 +505,11 @@ def run_experiment(args):
                 continue
 
             if train_sample_num - args.train_history_len < 0:
-                input_time_list = train_times[0:train_sample_num]
+                input_time_list = [int(ts) for ts in train_times[0:train_sample_num]]
             else:
-                input_time_list = train_times[train_sample_num - args.train_history_len: train_sample_num]
+                input_time_list = [int(ts) for ts in train_times[train_sample_num - args.train_history_len: train_sample_num]]
 
-            history_glist = [graph_cache[int(ts)] for ts in input_time_list]
+            history_glist = [graph_cache.get(int(ts), all_snap_map[int(ts)]) for ts in input_time_list]
 
             output_np = train_list[train_sample_num]
             if use_cuda:
@@ -572,6 +596,7 @@ def run_experiment(args):
                 hva_histories=hva_hist_train,
                 graph_cache=graph_cache,
                 sequence_cache=sequence_cache,
+                snap_map=all_snap_map,
             )
 
             current_mrr = mrr_filter if not args.relation_evaluation else mrr_filter_r
@@ -645,6 +670,7 @@ def run_experiment(args):
         hva_histories=hva_hist_train_valid,
         graph_cache=graph_cache,
         sequence_cache=sequence_cache,
+        snap_map=all_snap_map,
     )
 
 
