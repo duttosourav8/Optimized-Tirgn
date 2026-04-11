@@ -1,4 +1,3 @@
-# /content/Optimized-Tirgn/src/history_validity_gate.py
 import bisect
 from collections import defaultdict
 from typing import Dict, List, Tuple
@@ -87,6 +86,16 @@ def scatter_topk_back(full_scores: torch.Tensor, candidate_ids: torch.Tensor, ad
     return out
 
 
+def _to_numpy(x):
+    if torch.is_tensor(x):
+        return x.detach().cpu().numpy()
+    return np.asarray(x)
+
+
+def _to_device_float(np_array: np.ndarray, device: torch.device):
+    return torch.from_numpy(np_array).to(device=device, dtype=torch.float32)
+
+
 def build_topk_history_features_dual(
     query_triples,
     candidate_ids,
@@ -94,37 +103,33 @@ def build_topk_history_features_dual(
     so_hist,
     ro_hist,
     device,
+    mode: str = "dual_branch",
 ):
-    if torch.is_tensor(candidate_ids):
-        cand_np = candidate_ids.detach().cpu().numpy()
-    else:
-        cand_np = np.asarray(candidate_ids)
-
-    if torch.is_tensor(query_triples):
-        query_np = query_triples.detach().cpu().numpy()
-    else:
-        query_np = np.asarray(query_triples)
+    cand_np = _to_numpy(candidate_ids)
+    query_np = _to_numpy(query_triples)
 
     batch_size, k = cand_np.shape
 
-    seen_sr = torch.zeros((batch_size, k), dtype=torch.float32, device=device)
-    dt_sr = torch.zeros((batch_size, k), dtype=torch.float32, device=device)
-    freq_sr = torch.zeros((batch_size, k), dtype=torch.float32, device=device)
+    seen_sr = np.zeros((batch_size, k), dtype=np.float32)
+    dt_sr = np.zeros((batch_size, k), dtype=np.float32)
+    freq_sr = np.zeros((batch_size, k), dtype=np.float32)
 
-    seen_so = torch.zeros((batch_size, k), dtype=torch.float32, device=device)
-    dt_so = torch.zeros((batch_size, k), dtype=torch.float32, device=device)
-    freq_so = torch.zeros((batch_size, k), dtype=torch.float32, device=device)
+    seen_so = np.zeros((batch_size, k), dtype=np.float32)
+    dt_so = np.zeros((batch_size, k), dtype=np.float32)
+    freq_so = np.zeros((batch_size, k), dtype=np.float32)
 
-    seen_ro = torch.zeros((batch_size, k), dtype=torch.float32, device=device)
-    dt_ro = torch.zeros((batch_size, k), dtype=torch.float32, device=device)
-    freq_ro = torch.zeros((batch_size, k), dtype=torch.float32, device=device)
+    seen_ro = np.zeros((batch_size, k), dtype=np.float32)
+    dt_ro = np.zeros((batch_size, k), dtype=np.float32)
+    freq_ro = np.zeros((batch_size, k), dtype=np.float32)
+
+    exact_only = (mode == "exact_only")
 
     for i in range(batch_size):
         s, r, _, t = map(int, query_np[i][:4])
 
         cand_map_sr = sr_hist.get((s, r), {})
-        cand_map_so = so_hist.get(s, {})
-        cand_map_ro = ro_hist.get(r, {})
+        cand_map_so = None if exact_only else so_hist.get(s, {})
+        cand_map_ro = None if exact_only else ro_hist.get(r, {})
 
         for j, cand_o in enumerate(cand_np[i]):
             cand_o = int(cand_o)
@@ -137,23 +142,34 @@ def build_topk_history_features_dual(
                     dt_sr[i, j] = float(t - lt)
                     freq_sr[i, j] = float(freq_before(times_sr, t))
 
-            times_so = cand_map_so.get(cand_o, [])
-            if times_so:
-                lt = last_time_before(times_so, t)
-                if lt is not None:
-                    seen_so[i, j] = 1.0
-                    dt_so[i, j] = float(t - lt)
-                    freq_so[i, j] = float(freq_before(times_so, t))
+            if not exact_only:
+                times_so = cand_map_so.get(cand_o, [])
+                if times_so:
+                    lt = last_time_before(times_so, t)
+                    if lt is not None:
+                        seen_so[i, j] = 1.0
+                        dt_so[i, j] = float(t - lt)
+                        freq_so[i, j] = float(freq_before(times_so, t))
 
-            times_ro = cand_map_ro.get(cand_o, [])
-            if times_ro:
-                lt = last_time_before(times_ro, t)
-                if lt is not None:
-                    seen_ro[i, j] = 1.0
-                    dt_ro[i, j] = float(t - lt)
-                    freq_ro[i, j] = float(freq_before(times_ro, t))
+                times_ro = cand_map_ro.get(cand_o, [])
+                if times_ro:
+                    lt = last_time_before(times_ro, t)
+                    if lt is not None:
+                        seen_ro[i, j] = 1.0
+                        dt_ro[i, j] = float(t - lt)
+                        freq_ro[i, j] = float(freq_before(times_ro, t))
 
-    return seen_sr, dt_sr, freq_sr, seen_so, dt_so, freq_so, seen_ro, dt_ro, freq_ro
+    return (
+        _to_device_float(seen_sr, device),
+        _to_device_float(dt_sr, device),
+        _to_device_float(freq_sr, device),
+        _to_device_float(seen_so, device),
+        _to_device_float(dt_so, device),
+        _to_device_float(freq_so, device),
+        _to_device_float(seen_ro, device),
+        _to_device_float(dt_ro, device),
+        _to_device_float(freq_ro, device),
+    )
 
 
 def novelty_bucket_from_history(s, r, o, t, sr_hist, so_hist, ro_hist):
@@ -242,8 +258,8 @@ class HistoryValidityAdapter(nn.Module):
 
     def _normalize_freq(self, freq, seen):
         freq_feat = torch.log1p(torch.clamp(freq, min=0.0))
-        freq_feat = freq_feat / (freq_feat.max(dim=1, keepdim=True).values + 1e-8)
-        freq_feat = freq_feat * seen
+        denom = freq_feat.max(dim=1, keepdim=True).values.clamp_min(1e-8)
+        freq_feat = (freq_feat / denom) * seen
         return freq_feat
 
     def _branch_exact(self, rel_ids, seen, dt, freq):
