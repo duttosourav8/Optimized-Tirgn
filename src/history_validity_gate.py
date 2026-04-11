@@ -1,5 +1,4 @@
 import bisect
-from collections import defaultdict
 from typing import Dict, List, Tuple
 
 import numpy as np
@@ -25,9 +24,9 @@ def augment_with_inverse(triples: List[Triple], num_rels: int) -> List[Triple]:
 
 
 def build_sr_history(triples: List[Triple]) -> Dict[Tuple[int, int], Dict[int, List[int]]]:
-    sr_hist = defaultdict(lambda: defaultdict(list))
+    sr_hist = {}
     for s, r, o, t in triples:
-        sr_hist[(s, r)][o].append(t)
+        sr_hist.setdefault((s, r), {}).setdefault(o, []).append(t)
     for sr_key in sr_hist:
         for o in sr_hist[sr_key]:
             sr_hist[sr_key][o].sort()
@@ -35,9 +34,9 @@ def build_sr_history(triples: List[Triple]) -> Dict[Tuple[int, int], Dict[int, L
 
 
 def build_so_history(triples: List[Triple]):
-    so_hist = defaultdict(lambda: defaultdict(list))
+    so_hist = {}
     for s, r, o, t in triples:
-        so_hist[s][o].append(t)
+        so_hist.setdefault(s, {}).setdefault(o, []).append(t)
     for s in so_hist:
         for o in so_hist[s]:
             so_hist[s][o].sort()
@@ -45,9 +44,9 @@ def build_so_history(triples: List[Triple]):
 
 
 def build_ro_history(triples: List[Triple]):
-    ro_hist = defaultdict(lambda: defaultdict(list))
+    ro_hist = {}
     for s, r, o, t in triples:
-        ro_hist[r][o].append(t)
+        ro_hist.setdefault(r, {}).setdefault(o, []).append(t)
     for r in ro_hist:
         for o in ro_hist[r]:
             ro_hist[r][o].sort()
@@ -65,27 +64,6 @@ def freq_before(times: List[int], t: int) -> int:
     return bisect.bisect_left(times, t)
 
 
-def build_topk_candidate_ids(base_scores: torch.Tensor, gold_ids: torch.Tensor, topk_cands: int) -> torch.Tensor:
-    k = min(topk_cands, base_scores.size(1))
-    topk_ids = torch.topk(base_scores, k=k, dim=1).indices
-
-    rows = []
-    for i in range(topk_ids.size(0)):
-        row = topk_ids[i].tolist()
-        g = int(gold_ids[i].item())
-        if g not in row:
-            row[-1] = g
-        rows.append(row)
-
-    return torch.tensor(rows, dtype=torch.long, device=base_scores.device)
-
-
-def scatter_topk_back(full_scores: torch.Tensor, candidate_ids: torch.Tensor, adjusted_topk_scores: torch.Tensor):
-    out = full_scores.clone()
-    out.scatter_(1, candidate_ids, adjusted_topk_scores)
-    return out
-
-
 def _to_numpy(x):
     if torch.is_tensor(x):
         return x.detach().cpu().numpy()
@@ -94,6 +72,26 @@ def _to_numpy(x):
 
 def _to_device_float(np_array: np.ndarray, device: torch.device):
     return torch.from_numpy(np_array).to(device=device, dtype=torch.float32)
+
+
+def build_topk_candidate_ids(base_scores: torch.Tensor, gold_ids: torch.Tensor, topk_cands: int) -> torch.Tensor:
+    k = min(topk_cands, base_scores.size(1))
+    topk_ids = torch.topk(base_scores, k=k, dim=1).indices
+    gold_ids = gold_ids.view(-1, 1)
+
+    contains_gold = (topk_ids == gold_ids).any(dim=1)
+    if not bool(contains_gold.all()):
+        topk_ids = topk_ids.clone()
+        missing_rows = ~contains_gold
+        topk_ids[missing_rows, -1] = gold_ids[missing_rows, 0]
+
+    return topk_ids
+
+
+def scatter_topk_back(full_scores: torch.Tensor, candidate_ids: torch.Tensor, adjusted_topk_scores: torch.Tensor):
+    out = full_scores.clone()
+    out.scatter_(1, candidate_ids, adjusted_topk_scores)
+    return out
 
 
 def build_topk_history_features_dual(
@@ -114,15 +112,21 @@ def build_topk_history_features_dual(
     dt_sr = np.zeros((batch_size, k), dtype=np.float32)
     freq_sr = np.zeros((batch_size, k), dtype=np.float32)
 
-    seen_so = np.zeros((batch_size, k), dtype=np.float32)
-    dt_so = np.zeros((batch_size, k), dtype=np.float32)
-    freq_so = np.zeros((batch_size, k), dtype=np.float32)
-
-    seen_ro = np.zeros((batch_size, k), dtype=np.float32)
-    dt_ro = np.zeros((batch_size, k), dtype=np.float32)
-    freq_ro = np.zeros((batch_size, k), dtype=np.float32)
-
     exact_only = (mode == "exact_only")
+    if exact_only:
+        seen_so = np.zeros((batch_size, k), dtype=np.float32)
+        dt_so = np.zeros((batch_size, k), dtype=np.float32)
+        freq_so = np.zeros((batch_size, k), dtype=np.float32)
+        seen_ro = np.zeros((batch_size, k), dtype=np.float32)
+        dt_ro = np.zeros((batch_size, k), dtype=np.float32)
+        freq_ro = np.zeros((batch_size, k), dtype=np.float32)
+    else:
+        seen_so = np.zeros((batch_size, k), dtype=np.float32)
+        dt_so = np.zeros((batch_size, k), dtype=np.float32)
+        freq_so = np.zeros((batch_size, k), dtype=np.float32)
+        seen_ro = np.zeros((batch_size, k), dtype=np.float32)
+        dt_ro = np.zeros((batch_size, k), dtype=np.float32)
+        freq_ro = np.zeros((batch_size, k), dtype=np.float32)
 
     for i in range(batch_size):
         s, r, _, t = map(int, query_np[i][:4])
@@ -131,8 +135,9 @@ def build_topk_history_features_dual(
         cand_map_so = None if exact_only else so_hist.get(s, {})
         cand_map_ro = None if exact_only else ro_hist.get(r, {})
 
-        for j, cand_o in enumerate(cand_np[i]):
-            cand_o = int(cand_o)
+        row_cands = cand_np[i]
+        for j in range(k):
+            cand_o = int(row_cands[j])
 
             times_sr = cand_map_sr.get(cand_o, [])
             if times_sr:
@@ -205,7 +210,7 @@ def stale_exact_bucket(s, r, o, t, sr_hist):
 
 class HistoryValidityAdapter(nn.Module):
     """
-    Reusable end-to-end candidate-level history-validity adapter.
+    End-to-end candidate-level history-validity adapter.
     Modes:
       - exact_only
       - dual_branch
@@ -259,8 +264,7 @@ class HistoryValidityAdapter(nn.Module):
     def _normalize_freq(self, freq, seen):
         freq_feat = torch.log1p(torch.clamp(freq, min=0.0))
         denom = freq_feat.max(dim=1, keepdim=True).values.clamp_min(1e-8)
-        freq_feat = (freq_feat / denom) * seen
-        return freq_feat
+        return (freq_feat / denom) * seen
 
     def _branch_exact(self, rel_ids, seen, dt, freq):
         lam = F.softplus(self.rel_lambda_sr(rel_ids)).squeeze(-1).unsqueeze(1)
